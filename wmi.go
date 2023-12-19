@@ -3,29 +3,31 @@
 package vss
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"os"
 	"runtime"
 	"sort"
+	"strconv"
+	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/go-ole/go-ole"
 	"github.com/go-ole/go-ole/oleutil"
-	"golang.org/x/sys/windows"
 )
 
 // sWbemServices is an instance of SWbemServices object.
 type sWbemServices struct{ ole.IDispatch }
 
-// wmiExec calls fn after initializing the COM library. sWbemServices is
-// released automatically when fn returns.
+// wmiExec calls fn after initializing the COM library. sWbemServices and all
+// COM resources are released when fn returns.
 func wmiExec(fn func(s *sWbemServices) error) error {
-	uninit, err := initCOM()
-	if err != nil {
+	if err := initCOM(); err != nil {
 		return err
 	}
-	defer uninit()
+	defer uninitCOM()
 	s, err := connectServer()
 	if err != nil {
 		return err
@@ -34,9 +36,8 @@ func wmiExec(fn func(s *sWbemServices) error) error {
 	return fn(s)
 }
 
-// initCOM initializes the COM library. If successful, it returns a function
-// that must be called to release all COM resources.
-func initCOM() (uninit func(), err error) {
+// initCOM initializes the COM library.
+func initCOM() (err error) {
 	runtime.LockOSThread()
 	defer func() {
 		if err != nil {
@@ -44,12 +45,19 @@ func initCOM() (uninit func(), err error) {
 		}
 	}()
 	if err := ole.CoInitializeEx(0, ole.COINIT_MULTITHREADED); err != nil {
+		const sFALSE = 1
 		var e *ole.OleError
-		if !errors.As(err, &e) || (e.Code() != ole.S_OK && e.Code() != uintptr(windows.S_FALSE)) {
-			return nil, err
+		if !errors.As(err, &e) || (e.Code() != ole.S_OK && e.Code() != sFALSE) {
+			return fmt.Errorf("vss: CoInitializeEx failed (%w)", err)
 		}
 	}
-	return func() { ole.CoUninitialize(); runtime.UnlockOSThread() }, nil
+	return nil
+}
+
+// uninitCOM releases all COM resources.
+func uninitCOM() {
+	ole.CoUninitialize()
+	runtime.UnlockOSThread()
 }
 
 var (
@@ -64,22 +72,20 @@ func connectServer() (*sWbemServices, error) {
 	if err != nil {
 		return nil, fmt.Errorf("vss: failed to create SWbemLocator (%w)", err)
 	}
+	defer unk.Release()
 	sWbemLocator := (*ole.IDispatch)(unsafe.Pointer(unk))
-	defer sWbemLocator.Release()
-	v, err := sWbemLocator.CallMethod("ConnectServer", nil, `root\CIMV2`)
+	vs, err := sWbemLocator.CallMethod("ConnectServer", nil, `root\CIMV2`)
 	if err != nil {
 		return nil, fmt.Errorf("vss: ConnectServer failed (%w)", err)
 	}
-	defer mustClear(v) // Calls Release
-	s := (*sWbemServices)(unsafe.Pointer(v.ToIDispatch()))
-	s.AddRef()
+	defer mustClear(vs)
+	s := (*sWbemServices)(unsafe.Pointer(vs.ToIDispatch()))
+	s.AddRef() // Prevent mustClear from freeing the object
 	return s, nil
 }
 
-type iterFunc func(*ole.IDispatch) error
-
 // execQuery executes a WQL query and calls fn for each returned object.
-func (s *sWbemServices) execQuery(query string, fn iterFunc) error {
+func (s *sWbemServices) execQuery(wql string, fn func(*ole.IDispatch) error) error {
 	// https://learn.microsoft.com/en-us/windows/win32/api/wbemdisp/ne-wbemdisp-wbemflagenum
 	const (
 		wbemFlagForwardOnly       = 0x20
@@ -87,61 +93,71 @@ func (s *sWbemServices) execQuery(query string, fn iterFunc) error {
 	)
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/example--getting-wmi-data-from-the-local-computer
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/improving-enumeration-performance
-	q, err := s.CallMethod("ExecQuery", query, "WQL", wbemFlagForwardOnly|wbemFlagReturnImmediately)
+	v, err := s.CallMethod("ExecQuery", wql, "WQL", wbemFlagForwardOnly|wbemFlagReturnImmediately)
 	if err != nil {
 		return fmt.Errorf("vss: ExecQuery failed (%w)", err)
 	}
-	defer mustClear(q)
-	return oleutil.ForEach(q.ToIDispatch(), func(v *ole.VARIANT) error {
+	defer mustClear(v)
+	return oleutil.ForEach(v.ToIDispatch(), func(v *ole.VARIANT) error {
 		defer mustClear(v)
 		return fn(v.ToIDispatch())
 	})
 }
 
 // queryOne executes a query expecting to get exactly one object and returns the
-// result of calling get on that object.
-func queryOne[T any](s *sWbemServices, query string, get func(v *ole.IDispatch) (T, error)) (T, error) {
+// result of calling fn on it.
+func queryOne[T any](s *sWbemServices, wql string, fn func(v *ole.IDispatch) (T, error)) (T, error) {
 	var out T
 	var ok bool
-	err := s.execQuery(query, func(v *ole.IDispatch) (err error) {
+	err := s.execQuery(wql, func(v *ole.IDispatch) (err error) {
 		if ok {
-			return fmt.Errorf("vss: multiple matches: %s", query)
+			return fmt.Errorf("vss: multiple matches: %s", wql)
 		}
 		ok = true
-		out, err = get(v)
+		out, err = fn(v)
 		return
 	})
 	if err == nil && !ok {
-		err = fmt.Errorf("vss: not found: %s", query)
+		err = fmt.Errorf("vss: not found: %s", wql)
 	}
 	return out, err
 }
 
 // getProps returns all properties of v in a map.
 func getProps(v *ole.IDispatch) (map[string]any, error) {
-	p, err := v.GetProperty("Properties_")
+	vps, err := v.GetProperty("Properties_")
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("vss: failed to get Properties_ (%w)", err)
 	}
-	defer mustClear(p)
+	defer mustClear(vps)
 	all := make(map[string]any)
-	err = oleutil.ForEach(p.ToIDispatch(), func(v *ole.VARIANT) error {
+	err = oleutil.ForEach(vps.ToIDispatch(), func(v *ole.VARIANT) error {
 		defer mustClear(v)
 		p := v.ToIDispatch()
-		name, err := p.GetProperty("Name")
+		vname, err := p.GetProperty("Name")
 		if err != nil {
-			return err
+			return fmt.Errorf("vss: failed to get Name property (%w)", err)
 		}
-		defer mustClear(name)
-		val, err := p.GetProperty("Value")
+		defer mustClear(vname)
+		vval, err := p.GetProperty("Value")
 		if err != nil {
-			return err
+			return fmt.Errorf("vss: failed to get Value property (%w)", err)
 		}
-		defer mustClear(val)
-		if val.VT == ole.VT_UNKNOWN || val.VT == ole.VT_DISPATCH {
-			all[name.ToString()] = "<object>" // References will be invalid
-		} else {
-			all[name.ToString()] = val.Value()
+		defer mustClear(vval)
+		switch name := vname.ToString(); vval.VT {
+		case ole.VT_BSTR:
+			val := vval.ToString()
+			if all[name] = val; name == "InstallDate" {
+				if t, err := parseDateTime(val); err == nil {
+					all[name] = t
+				}
+			}
+		case ole.VT_UNKNOWN:
+			all[name] = "<IUnknown>" // References will be invalid
+		case ole.VT_DISPATCH:
+			all[name] = "<IDispatch>" // References will be invalid
+		default:
+			all[name] = vval.Value()
 		}
 		return nil
 	})
@@ -150,9 +166,11 @@ func getProps(v *ole.IDispatch) (map[string]any, error) {
 
 // dumpProps writes all properties of v to stderr sorted by name.
 func dumpProps(v *ole.IDispatch) {
+	var b bytes.Buffer
+	defer func() { _, _ = fmt.Fprintf(os.Stderr, "%s\n", b.Bytes()) }()
 	all, err := getProps(v)
 	if err != nil {
-		_, _ = fmt.Fprintln(os.Stderr, "dumpProps error:", err)
+		_, _ = fmt.Fprintln(&b, "dumpProps error:", err)
 		return
 	}
 	keys, w := make([]string, 0, len(all)), 0
@@ -161,12 +179,63 @@ func dumpProps(v *ole.IDispatch) {
 	}
 	sort.Strings(keys)
 	for _, k := range keys {
-		_, _ = fmt.Fprintf(os.Stderr, "%*s: %v\n", w, k, all[k])
+		_, _ = fmt.Fprintf(&b, "%*s: %v\n", w, k, all[k])
 	}
-	_, _ = fmt.Fprintln(os.Stderr)
 }
 
-// mustClear panics if VariantClear returns an error.
+var (
+	clsidSWbemDateTime = ole.NewGUID("{47DFBE54-CF76-11d3-B38F-00105A1F473A}")
+	iidISWbemDateTime  = ole.NewGUID("{5E97458A-CF77-11D3-B38F-00105A1F473A}")
+)
+
+// parseDateTime converts a WMI datetime string (yyyymmddHHMMSS.mmmmmmsUUU) to
+// time.Time.
+func parseDateTime(s string) (time.Time, error) {
+	unk, err := ole.CreateInstance(clsidSWbemDateTime, iidISWbemDateTime)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("vss: failed to create SWbemDateTime (%w)", err)
+	}
+	defer unk.Release()
+	sWbemDateTime := (*ole.IDispatch)(unsafe.Pointer(unk))
+	if _, err = sWbemDateTime.PutProperty("Value", s); err != nil {
+		return time.Time{}, fmt.Errorf("vss: invalid datetime value: %s (%w)", s, err)
+	}
+	fts, err := sWbemDateTime.CallMethod("GetFileTime", false)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("vss: SWbemDateTime.GetFileTime failed (%w)", err)
+	}
+	defer mustClear(fts)
+	u, err := strconv.ParseUint(fts.ToString(), 10, 64)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("vss: invalid FILETIME: %s (%w)", fts.ToString(), err)
+	}
+	ft := syscall.Filetime{LowDateTime: uint32(u), HighDateTime: uint32(u >> 32)}
+	return time.Unix(0, ft.Nanoseconds()), nil
+}
+
+// parseDateTime converts a WMI datetime string (yyyymmddHHMMSS.mmmmmmsUUU) to
+// time.Time.
+func parseDateTime2(dt string) (time.Time, error) {
+	s := len(dt) - 4
+	if s < 0 || (dt[s] != '-' && dt[s] != '+') {
+		return time.Time{}, fmt.Errorf("vss: invalid datetime: %s", dt)
+	}
+	off, err := strconv.ParseInt(dt[s:], 10, 11)
+	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/swbemdatetime-utc
+	if err != nil || off < -720 || 720 < off {
+		return time.Time{}, fmt.Errorf("vss: invalid UTC offset: %s", dt)
+	}
+	// SWbemDateTime.Value does not accept truncated milliseconds
+	tz := time.FixedZone("", int(off)*60)
+	t, err := time.ParseInLocation("20060102150405.000000", dt[:s], tz)
+	if err != nil {
+		return time.Time{}, fmt.Errorf("vss: invalid datetime: %s", dt)
+	}
+	return t.Local(), nil
+}
+
+// mustClear panics if VariantClear returns an error. If v is a VT_UNKNOWN or
+// VT_DISPATCH, then this also releases the object.
 func mustClear(v *ole.VARIANT) {
 	if err := v.Clear(); err != nil {
 		panic(err)
