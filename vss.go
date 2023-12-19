@@ -5,10 +5,13 @@ package vss
 import (
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/go-ole/go-ole"
+	"golang.org/x/sys/windows"
 )
 
 // Create creates a new shadow copy of the specified volume (e.g. "C:") and
@@ -67,14 +70,58 @@ func Delete(idOrLink string) error {
 	return syscall.RemoveDirectory(utf16Ptr(idOrLink))
 }
 
-// List lists the properties of all shadow copies to stderr.
-func List() error {
-	return wmiExec(func(s *sWbemServices) error {
-		return s.execQuery("SELECT * FROM Win32_ShadowCopy", func(sc *ole.IDispatch) error {
-			dumpProps(sc)
+// ShadowCopy is a subset of Win32_ShadowCopy properties.
+type ShadowCopy struct {
+	DeviceObject string
+	ID           string
+	InstallDate  time.Time
+	VolumeName   string
+}
+
+// List returns information about existing shadow copies. If vol is non-empty,
+// only shadow copies for the specified volume are turned.
+func List(vol string) ([]*ShadowCopy, error) {
+	var wql = "SELECT DeviceObject,ID,InstallDate,VolumeName FROM Win32_ShadowCopy"
+	if vol != "" {
+		vol, err := volName(vol)
+		if err != nil {
+			return nil, err
+		}
+		wql += fmt.Sprintf(" WHERE VolumeName=%q", vol)
+	}
+	var all []*ShadowCopy
+	err := wmiExec(func(s *sWbemServices) error {
+		return s.execQuery(wql, func(v *ole.IDispatch) (err error) {
+			m, err := getProps(v)
+			if err != nil {
+				return err
+			}
+			t, err := parseDateTime(m["InstallDate"].(string))
+			if err != nil {
+				return err
+			}
+			all = append(all, &ShadowCopy{
+				DeviceObject: m["DeviceObject"].(string),
+				ID:           m["ID"].(string),
+				InstallDate:  t,
+				VolumeName:   m["VolumeName"].(string),
+			})
 			return nil
 		})
 	})
+	return all, err
+}
+
+// VolumePath returns the drive letter and/or folder where the shadow copy's
+// original volume is mounted. If the volume is mounted at multiple locations,
+// only the first one is returned.
+func (sc *ShadowCopy) VolumePath() (string, error) {
+	m, err := volPaths(sc.VolumeName)
+	if err != nil || len(m) == 0 {
+		return "", err
+	}
+	sort.Strings(m)
+	return m[0], nil
 }
 
 // createCodeString translates Win32_ShadowCopy.Create return code to a string.
@@ -118,7 +165,7 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 
 // deleteByID deletes a shadow copy by ID.
 func deleteByID(s *sWbemServices, id *ole.GUID) error {
-	_, err := s.CallMethod("Delete", fmt.Sprintf(`Win32_ShadowCopy.ID="%s"`, id))
+	_, err := s.CallMethod("Delete", fmt.Sprintf("Win32_ShadowCopy.ID=%q", id))
 	return err
 }
 
@@ -134,8 +181,8 @@ func deleteByDeviceObject(s *sWbemServices, dev string) error {
 // deviceObjectOfID returns the DeviceObject property of the specified shadow
 // copy ID.
 func deviceObjectOfID(s *sWbemServices, id *ole.GUID) (string, error) {
-	query := fmt.Sprintf(`SELECT DeviceObject FROM Win32_ShadowCopy WHERE ID="%s"`, id)
-	return queryOne(s, query, func(sc *ole.IDispatch) (string, error) {
+	wql := fmt.Sprintf("SELECT DeviceObject FROM Win32_ShadowCopy WHERE ID=%q", id)
+	return queryOne(s, wql, func(sc *ole.IDispatch) (string, error) {
 		if p, err := sc.GetProperty("DeviceObject"); err == nil {
 			defer mustClear(p)
 			return p.ToString(), nil
@@ -148,9 +195,8 @@ func deviceObjectOfID(s *sWbemServices, id *ole.GUID) (string, error) {
 // idOfDeviceObject returns the ID property of the specified shadow copy
 // DeviceObject.
 func idOfDeviceObject(s *sWbemServices, dev string) (*ole.GUID, error) {
-	query := fmt.Sprintf(`SELECT ID FROM Win32_ShadowCopy WHERE DeviceObject="%s"`,
-		strings.ReplaceAll(dev, `\`, `\\`))
-	return queryOne(s, query, func(sc *ole.IDispatch) (*ole.GUID, error) {
+	wql := fmt.Sprintf("SELECT ID FROM Win32_ShadowCopy WHERE DeviceObject=%q", dev)
+	return queryOne(s, wql, func(sc *ole.IDispatch) (*ole.GUID, error) {
 		if p, err := sc.GetProperty("ID"); err == nil {
 			defer mustClear(p)
 			return parseID(p.ToString())
@@ -168,6 +214,45 @@ func parseID(id string) (*ole.GUID, error) {
 	return nil, fmt.Errorf("vss: invalid ID %q", id)
 }
 
+// volName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
+// format. If vol is already in the GUID format, it is returned unmodified.
+func volName(vol string) (string, error) {
+	const volLen = len(`\\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`)
+	if vol = filepath.FromSlash(vol); vol[len(vol)-1] != '\\' {
+		vol += `\`
+	}
+	if len(vol) != volLen || !strings.HasPrefix(vol, `\\?\Volume{`) {
+		var buf [volLen + 1]uint16
+		err := windows.GetVolumeNameForVolumeMountPoint(utf16Ptr(vol), &buf[0], uint32(len(buf)))
+		if err != nil {
+			return "", fmt.Errorf("vss: failed to get volume name of %#q (%w)", vol, err)
+		}
+		vol = syscall.UTF16ToString(buf[:])
+	}
+	return vol, nil
+}
+
+// volPaths returns all mount points for the specified volume name.
+func volPaths(vol string) ([]string, error) {
+	var buf [2 * syscall.MAX_PATH]uint16
+	var n uint32
+	err := windows.GetVolumePathNamesForVolumeName(utf16Ptr(vol), &buf[0], uint32(len(buf)), &n)
+	if n--; err != nil || len(buf) < int(n) {
+		return nil, fmt.Errorf("vss: failed to get volume paths for %#q (%w)", vol, err)
+	}
+	var all []string
+	for b := buf[:n]; len(b) > 0; {
+		i := 0
+		for i < len(b) && b[i] != 0 {
+			i++
+		}
+		all = append(all, syscall.UTF16ToString(b[:i]))
+		b = b[min(i+1, len(b)):]
+	}
+	return all, nil
+}
+
+// utf16Ptr converts s to UTF-16 format for Windows API calls.
 func utf16Ptr(s string) *uint16 {
 	p, err := syscall.UTF16PtrFromString(s)
 	if err != nil {

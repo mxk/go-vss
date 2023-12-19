@@ -144,17 +144,8 @@ func getProps(v *ole.IDispatch) (map[string]any, error) {
 		}
 		defer mustClear(vval)
 		switch name := vname.ToString(); vval.VT {
-		case ole.VT_BSTR:
-			val := vval.ToString()
-			if all[name] = val; name == "InstallDate" {
-				if t, err := parseDateTime(val); err == nil {
-					all[name] = t
-				}
-			}
-		case ole.VT_UNKNOWN:
-			all[name] = "<IUnknown>" // References will be invalid
-		case ole.VT_DISPATCH:
-			all[name] = "<IDispatch>" // References will be invalid
+		case ole.VT_UNKNOWN, ole.VT_DISPATCH:
+			all[name] = vval.VT.String() // References will be invalid
 		default:
 			all[name] = vval.Value()
 		}
