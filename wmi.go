@@ -10,7 +10,6 @@ import (
 	"runtime"
 	"sort"
 	"strconv"
-	"syscall"
 	"time"
 	"unsafe"
 
@@ -183,53 +182,25 @@ func dumpProps(v *ole.IDispatch) {
 	}
 }
 
-var (
-	clsidSWbemDateTime = ole.NewGUID("{47DFBE54-CF76-11d3-B38F-00105A1F473A}")
-	iidISWbemDateTime  = ole.NewGUID("{5E97458A-CF77-11D3-B38F-00105A1F473A}")
-)
-
 // parseDateTime converts a WMI datetime string (yyyymmddHHMMSS.mmmmmmsUUU) to
 // time.Time.
-func parseDateTime(s string) (time.Time, error) {
-	unk, err := ole.CreateInstance(clsidSWbemDateTime, iidISWbemDateTime)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("vss: failed to create SWbemDateTime (%w)", err)
-	}
-	defer unk.Release()
-	sWbemDateTime := (*ole.IDispatch)(unsafe.Pointer(unk))
-	if _, err = sWbemDateTime.PutProperty("Value", s); err != nil {
-		return time.Time{}, fmt.Errorf("vss: invalid datetime value: %s (%w)", s, err)
-	}
-	fts, err := sWbemDateTime.CallMethod("GetFileTime", false)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("vss: SWbemDateTime.GetFileTime failed (%w)", err)
-	}
-	defer mustClear(fts)
-	u, err := strconv.ParseUint(fts.ToString(), 10, 64)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("vss: invalid FILETIME: %s (%w)", fts.ToString(), err)
-	}
-	ft := syscall.Filetime{LowDateTime: uint32(u), HighDateTime: uint32(u >> 32)}
-	return time.Unix(0, ft.Nanoseconds()), nil
-}
-
-// parseDateTime converts a WMI datetime string (yyyymmddHHMMSS.mmmmmmsUUU) to
-// time.Time.
-func parseDateTime2(dt string) (time.Time, error) {
-	s := len(dt) - 4
-	if s < 0 || (dt[s] != '-' && dt[s] != '+') {
+func parseDateTime(dt string) (time.Time, error) {
+	// This logic is the same as creating an SWbemDateTime object, setting its
+	// Value property, and calling GetFileTime method, but much faster.
+	const sign = 21
+	if len(dt) != sign+4 || (dt[sign] != '-' && dt[sign] != '+') {
 		return time.Time{}, fmt.Errorf("vss: invalid datetime: %s", dt)
 	}
-	off, err := strconv.ParseInt(dt[s:], 10, 11)
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/swbemdatetime-utc
+	off, err := strconv.Atoi(dt[sign:])
 	if err != nil || off < -720 || 720 < off {
 		return time.Time{}, fmt.Errorf("vss: invalid UTC offset: %s", dt)
 	}
-	// SWbemDateTime.Value does not accept truncated milliseconds
-	tz := time.FixedZone("", int(off)*60)
-	t, err := time.ParseInLocation("20060102150405.000000", dt[:s], tz)
+	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/cim-datetime
+	tz := time.FixedZone("", off*60)
+	t, err := time.ParseInLocation("20060102150405.000000", dt[:sign], tz)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("vss: invalid datetime: %s", dt)
+		return time.Time{}, fmt.Errorf("vss: failed to parse datetime: %s", dt)
 	}
 	return t.Local(), nil
 }
