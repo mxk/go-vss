@@ -83,7 +83,7 @@ type ShadowCopy struct {
 func List(vol string) ([]*ShadowCopy, error) {
 	var wql = "SELECT DeviceObject,ID,InstallDate,VolumeName FROM Win32_ShadowCopy"
 	if vol != "" {
-		vol, err := volName(vol)
+		vol, err := volumeName(vol)
 		if err != nil {
 			return nil, err
 		}
@@ -116,12 +116,30 @@ func List(vol string) ([]*ShadowCopy, error) {
 // original volume is mounted. If the volume is mounted at multiple locations,
 // only the first one is returned.
 func (sc *ShadowCopy) VolumePath() (string, error) {
-	m, err := volPaths(sc.VolumeName)
+	m, err := volumePaths(sc.VolumeName)
 	if err != nil || len(m) == 0 {
 		return "", err
 	}
 	sort.Strings(m)
 	return m[0], nil
+}
+
+// SplitVolume splits an absolute file path into its volume mount point and the
+// path relative to the mount. For example, "C:\Windows" returns "C:\" and
+// "Windows".
+func SplitVolume(name string) (vol string, rel string, err error) {
+	if name = filepath.Clean(name); !filepath.IsAbs(name) {
+		// We don't want GetVolumePathName returning the boot volume for
+		// relative paths.
+		return "", "", fmt.Errorf("vss: path without volume: %s", name)
+	}
+	var buf [syscall.MAX_PATH]uint16
+	if err = windows.GetVolumePathName(utf16Ptr(name), &buf[0], uint32(len(buf))); err != nil {
+		return "", "", fmt.Errorf("vss: GetVolumePathName failed for: %s (%w)", name, err)
+	}
+	vol = syscall.UTF16ToString(buf[:])
+	rel, err = filepath.Rel(vol, name)
+	return
 }
 
 // createCodeString translates Win32_ShadowCopy.Create return code to a string.
@@ -214,9 +232,9 @@ func parseID(id string) (*ole.GUID, error) {
 	return nil, fmt.Errorf("vss: invalid ID %q", id)
 }
 
-// volName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
+// volumeName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
 // format. If vol is already in the GUID format, it is returned unmodified.
-func volName(vol string) (string, error) {
+func volumeName(vol string) (string, error) {
 	const volLen = len(`\\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`)
 	if vol = filepath.FromSlash(vol); vol[len(vol)-1] != '\\' {
 		vol += `\`
@@ -232,8 +250,8 @@ func volName(vol string) (string, error) {
 	return vol, nil
 }
 
-// volPaths returns all mount points for the specified volume name.
-func volPaths(vol string) ([]string, error) {
+// volumePaths returns all mount points for the specified volume name.
+func volumePaths(vol string) ([]string, error) {
 	var buf [2 * syscall.MAX_PATH]uint16
 	var n uint32
 	err := windows.GetVolumePathNamesForVolumeName(utf16Ptr(vol), &buf[0], uint32(len(buf)), &n)
