@@ -47,6 +47,21 @@ func Link(link, id string) error {
 		syscall.SYMBOLIC_LINK_FLAG_DIRECTORY)
 }
 
+// LinkNew creates a new shadow copy and links it at the specified path.
+// The shadow copy is deleted if the operation fails.
+func LinkNew(link, vol string) (err error) {
+	id, err := Create(vol)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = Delete(id)
+		}
+	}()
+	return Link(link, id)
+}
+
 // Delete deletes a shadow copy, which can be specified either by ID or a file
 // system path to a symlink where the shadow copy is mounted.
 func Delete(idOrLink string) error {
@@ -163,6 +178,7 @@ var createCodeString = map[int64]string{
 // create creates a new shadow copy of the specified volume and
 // returns its ID.
 func create(s *sWbemServices, vol string) (*ole.GUID, error) {
+	// TODO: Directory mounts
 	vol = filepath.VolumeName(vol) + `\` // Trailing separator is required
 	sc, err := s.CallMethod("Get", "Win32_ShadowCopy")
 	if err != nil {
