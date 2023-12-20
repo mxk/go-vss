@@ -4,6 +4,7 @@ package vss
 
 import (
 	"fmt"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -14,9 +15,16 @@ import (
 	"golang.org/x/sys/windows"
 )
 
+// errNotAdmin is returned when the current user lacks sufficient privileges.
+var errNotAdmin = fmt.Errorf("vss: do not have Administrators group privileges (%w)",
+	os.ErrPermission)
+
 // Create creates a new shadow copy of the specified volume (e.g. "C:") and
 // returns its ID.
 func Create(vol string) (string, error) {
+	if !isAdmin() {
+		return "", errNotAdmin
+	}
 	var id *ole.GUID
 	err := wmiExec(func(s *sWbemServices) (err error) {
 		id, err = create(s, vol)
@@ -31,6 +39,9 @@ func Create(vol string) (string, error) {
 // Link creates a directory symbolic link pointing to the contents of the
 // specified shadow copy ID.
 func Link(link, id string) error {
+	if !isAdmin() {
+		return errNotAdmin
+	}
 	g, err := parseID(id)
 	if err != nil {
 		return err
@@ -65,6 +76,9 @@ func LinkNew(link, vol string) (err error) {
 // Delete deletes a shadow copy, which can be specified either by ID or a file
 // system path to a symlink where the shadow copy is mounted.
 func Delete(idOrLink string) error {
+	if !isAdmin() {
+		return errNotAdmin
+	}
 	if g, err := parseID(idOrLink); err == nil {
 		return wmiExec(func(s *sWbemServices) error { return deleteByID(s, g) })
 	}
@@ -96,6 +110,9 @@ type ShadowCopy struct {
 // List returns information about existing shadow copies. If vol is non-empty,
 // only shadow copies for the specified volume are turned.
 func List(vol string) ([]*ShadowCopy, error) {
+	if !isAdmin() {
+		return nil, errNotAdmin
+	}
 	var wql = "SELECT DeviceObject,ID,InstallDate,VolumeName FROM Win32_ShadowCopy"
 	if vol != "" {
 		vol, err := volumeName(vol)
@@ -155,6 +172,31 @@ func SplitVolume(name string) (vol string, rel string, err error) {
 	vol = syscall.UTF16ToString(buf[:])
 	rel, err = filepath.Rel(vol, name)
 	return
+}
+
+// isAdmin returns whether the current thread is a member of the Administrators
+// group.
+func isAdmin() bool {
+	// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-checktokenmembership#examples
+	var AdministratorsGroup *windows.SID
+	err := windows.AllocateAndInitializeSid(
+		&windows.SECURITY_NT_AUTHORITY,
+		2,
+		windows.SECURITY_BUILTIN_DOMAIN_RID,
+		windows.DOMAIN_ALIAS_RID_ADMINS,
+		0, 0, 0, 0, 0, 0,
+		&AdministratorsGroup,
+	)
+	if err != nil {
+		return false
+	}
+	defer func() {
+		if err := windows.FreeSid(AdministratorsGroup); err != nil {
+			panic(err)
+		}
+	}()
+	ok, err := windows.Token(0).IsMember(AdministratorsGroup)
+	return ok && err == nil
 }
 
 // createCodeString translates Win32_ShadowCopy.Create return code to a string.
