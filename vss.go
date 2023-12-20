@@ -36,6 +36,21 @@ func Create(vol string) (string, error) {
 	return id.String(), nil
 }
 
+// CreateAt creates a new shadow copy and links it at the specified path. The
+// shadow copy is removed if linking fails.
+func CreateAt(link, vol string) (err error) {
+	id, err := Create(vol)
+	if err != nil {
+		return err
+	}
+	defer func() {
+		if err != nil {
+			_ = Remove(id)
+		}
+	}()
+	return Link(link, id)
+}
+
 // Link creates a directory symbolic link pointing to the contents of the
 // specified shadow copy ID.
 func Link(link, id string) error {
@@ -58,39 +73,24 @@ func Link(link, id string) error {
 		syscall.SYMBOLIC_LINK_FLAG_DIRECTORY)
 }
 
-// LinkNew creates a new shadow copy and links it at the specified path.
-// The shadow copy is deleted if the operation fails.
-func LinkNew(link, vol string) (err error) {
-	id, err := Create(vol)
-	if err != nil {
-		return err
-	}
-	defer func() {
-		if err != nil {
-			_ = Delete(id)
-		}
-	}()
-	return Link(link, id)
-}
-
-// Delete deletes a shadow copy, which can be specified either by ID or a file
+// Remove removes a shadow copy, which can be specified either by ID or a file
 // system path to a symlink where the shadow copy is mounted.
-func Delete(idOrLink string) error {
+func Remove(idOrLink string) error {
 	if !isAdmin() {
 		return errNotAdmin
 	}
 	if g, err := parseID(idOrLink); err == nil {
 		return wmiExec(func(s *sWbemServices) error { return deleteByID(s, g) })
 	}
-	var buf [syscall.MAX_PATH]byte
 	const prefix = `\\?\`
+	var buf [syscall.MAX_PATH]byte
 	n, err := syscall.Readlink(idOrLink, buf[copy(buf[:], prefix):])
 	if err != nil {
-		return fmt.Errorf("vss: not a valid symlink: %s (%w)", idOrLink, err)
+		return fmt.Errorf("vss: not a symlink: %s (%w)", idOrLink, err)
 	}
 	dev := strings.TrimSuffix(string(buf[:len(prefix)+n]), `\`)
-	if len(dev) == len(buf) || !strings.HasPrefix(dev, `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy`) {
-		return fmt.Errorf("vss: not a valid shadow copy symlink: %s", idOrLink)
+	if !strings.HasPrefix(dev, `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy`) {
+		return fmt.Errorf("vss: not a shadow copy symlink: %s", idOrLink)
 	}
 	err = wmiExec(func(s *sWbemServices) error { return deleteByDeviceObject(s, dev) })
 	if err != nil {
@@ -217,8 +217,7 @@ var createCodeString = map[int64]string{
 	13: "Unknown error",
 }
 
-// create creates a new shadow copy of the specified volume and
-// returns its ID.
+// create creates a new shadow copy of the specified volume and returns its ID.
 func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 	// TODO: Directory mounts
 	vol = filepath.VolumeName(vol) + `\` // Trailing separator is required
