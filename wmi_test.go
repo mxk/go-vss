@@ -3,11 +3,26 @@
 package vss
 
 import (
+	"os"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
+
+func TestWMI(t *testing.T) {
+	want, err := os.Hostname()
+	require.NoError(t, err)
+	err = wmiExec(func(s *sWbemServices) error {
+		const wql = "SELECT DNSHostName FROM Win32_ComputerSystem"
+		props, err := queryOne(s, wql, getProps)
+		require.NoError(t, err)
+		delete(props, "Name")
+		require.Equal(t, map[string]any{"DNSHostName": want}, props)
+		return nil
+	})
+	require.NoError(t, err)
+}
 
 func TestParseDateTime(t *testing.T) {
 	zone := time.FixedZone("EST", -300*60)

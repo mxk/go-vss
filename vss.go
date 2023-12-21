@@ -15,7 +15,7 @@ import (
 	"golang.org/x/sys/windows"
 )
 
-// errNotAdmin is returned when the current user lacks sufficient privileges.
+// errNotAdmin is returned when the current user lacks admin privileges.
 var errNotAdmin = fmt.Errorf("vss: do not have Administrators group privileges (%w)",
 	os.ErrPermission)
 

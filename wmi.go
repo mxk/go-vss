@@ -55,8 +55,8 @@ func initCOM() (err error) {
 
 // uninitCOM releases all COM resources.
 func uninitCOM() {
+	defer runtime.UnlockOSThread()
 	ole.CoUninitialize()
-	runtime.UnlockOSThread()
 }
 
 var (
@@ -73,14 +73,11 @@ func connectServer() (*sWbemServices, error) {
 	}
 	defer unk.Release()
 	sWbemLocator := (*ole.IDispatch)(unsafe.Pointer(unk))
-	vs, err := sWbemLocator.CallMethod("ConnectServer", nil, `root\CIMV2`)
+	v, err := sWbemLocator.CallMethod("ConnectServer", nil, `root\CIMV2`)
 	if err != nil {
-		return nil, fmt.Errorf("vss: ConnectServer failed (%w)", err)
+		return nil, fmt.Errorf("vss: SWbemLocator.ConnectServer failed (%w)", err)
 	}
-	defer mustClear(vs)
-	s := (*sWbemServices)(unsafe.Pointer(vs.ToIDispatch()))
-	s.AddRef() // Prevent mustClear from freeing the object
-	return s, nil
+	return (*sWbemServices)(unsafe.Pointer(v.ToIDispatch())), nil
 }
 
 // execQuery executes a WQL query and calls fn for each returned object.
@@ -94,7 +91,7 @@ func (s *sWbemServices) execQuery(wql string, fn func(*ole.IDispatch) error) err
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/improving-enumeration-performance
 	v, err := s.CallMethod("ExecQuery", wql, "WQL", wbemFlagForwardOnly|wbemFlagReturnImmediately)
 	if err != nil {
-		return fmt.Errorf("vss: ExecQuery failed (%w)", err)
+		return fmt.Errorf("vss: SWbemServices.ExecQuery failed (%w)", err)
 	}
 	defer mustClear(v)
 	return oleutil.ForEach(v.ToIDispatch(), func(v *ole.VARIANT) error {
@@ -110,7 +107,7 @@ func queryOne[T any](s *sWbemServices, wql string, fn func(v *ole.IDispatch) (T,
 	var ok bool
 	err := s.execQuery(wql, func(v *ole.IDispatch) (err error) {
 		if ok {
-			return fmt.Errorf("vss: multiple matches: %s", wql)
+			return fmt.Errorf("vss: multiple results: %s", wql)
 		}
 		ok = true
 		out, err = fn(v)
@@ -130,9 +127,9 @@ func getProps(v *ole.IDispatch) (map[string]any, error) {
 	}
 	defer mustClear(vps)
 	all := make(map[string]any)
-	err = oleutil.ForEach(vps.ToIDispatch(), func(v *ole.VARIANT) error {
-		defer mustClear(v)
-		p := v.ToIDispatch()
+	err = oleutil.ForEach(vps.ToIDispatch(), func(vp *ole.VARIANT) error {
+		defer mustClear(vp)
+		p := vp.ToIDispatch()
 		vname, err := p.GetProperty("Name")
 		if err != nil {
 			return fmt.Errorf("vss: failed to get Name property (%w)", err)
@@ -145,7 +142,7 @@ func getProps(v *ole.IDispatch) (map[string]any, error) {
 		defer mustClear(vval)
 		switch name := vname.ToString(); vval.VT {
 		case ole.VT_UNKNOWN, ole.VT_DISPATCH:
-			all[name] = vval.VT.String() // References will be invalid
+			all[name] = vval.VT.String() // Objects will be invalid
 		default:
 			all[name] = vval.Value()
 		}
@@ -185,13 +182,13 @@ func parseDateTime(dt string) (time.Time, error) {
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/swbemdatetime-utc
 	off, err := strconv.Atoi(dt[sign:])
 	if err != nil || off < -720 || 720 < off {
-		return time.Time{}, fmt.Errorf("vss: invalid UTC offset: %s", dt)
+		return time.Time{}, fmt.Errorf("vss: invalid datetime UTC offset: %s", dt)
 	}
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/cim-datetime
 	tz := time.FixedZone("", off*60)
 	t, err := time.ParseInLocation("20060102150405.000000", dt[:sign], tz)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("vss: failed to parse datetime: %s", dt)
+		return time.Time{}, fmt.Errorf("vss: failed to parse datetime: %s (%w)", dt, err)
 	}
 	return t.Local(), nil
 }
