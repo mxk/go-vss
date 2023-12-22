@@ -10,12 +10,12 @@ import (
 )
 
 func TestSplitVol(t *testing.T) {
-	vol, rel, err := SplitVolume(`.`)
+	_, _, err := SplitVolume(`.`)
 	assert.Error(t, err)
-	vol, rel, err = SplitVolume(`C:`)
+	_, _, err = SplitVolume(`C:`)
 	assert.Error(t, err)
 
-	vol, rel, err = SplitVolume(`C:\`)
+	vol, rel, err := SplitVolume(`C:\`)
 	require.NoError(t, err)
 	assert.Equal(t, []string{`C:\`, `.`}, []string{vol, rel})
 

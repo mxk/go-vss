@@ -151,6 +151,8 @@ func getProps(v *ole.IDispatch) (map[string]any, error) {
 	return all, err
 }
 
+var _ = dumpProps
+
 // dumpProps writes all properties of v to stderr sorted by name.
 func dumpProps(v *ole.IDispatch) {
 	var b bytes.Buffer
