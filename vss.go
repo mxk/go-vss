@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -36,8 +36,8 @@ func Create(vol string) (string, error) {
 	return id.String(), nil
 }
 
-// CreateAt creates a new shadow copy and links it at the specified path. The
-// shadow copy is removed if linking fails.
+// CreateAt creates a new shadow copy and symlinks it at the specified path. The
+// shadow copy is removed if symlinking fails.
 func CreateAt(link, vol string) (err error) {
 	id, err := Create(vol)
 	if err != nil {
@@ -48,97 +48,118 @@ func CreateAt(link, vol string) (err error) {
 			_ = Remove(id)
 		}
 	}()
-	return Link(link, id)
+	sc, _, err := get(id)
+	if err != nil {
+		return err
+	}
+	return sc.Link(link)
 }
 
-// Link creates a directory symbolic link pointing to the contents of the
-// specified shadow copy ID.
-func Link(link, id string) error {
+// Remove removes a shadow copy by ID, DeviceObject, or symlink path. If a valid
+// symlink is specified, then it is also removed.
+func Remove(name string) error {
 	if !isAdmin() {
 		return errNotAdmin
 	}
-	g, err := parseID(id)
+	if id := ole.NewGUID(name); id != nil {
+		return (&ShadowCopy{ID: id.String()}).Remove()
+	}
+	sc, symlink, err := get(name)
 	if err != nil {
 		return err
 	}
-	var dev string
-	err = wmiExec(func(s *sWbemServices) (err error) {
-		dev, err = deviceObjectOfID(s, g)
-		return
-	})
-	if err != nil {
-		return err
+	if err = sc.Remove(); err == nil && symlink != "" {
+		err = syscall.RemoveDirectory(utf16Ptr(symlink))
 	}
-	return syscall.CreateSymbolicLink(utf16Ptr(link), utf16Ptr(dev+`\`),
-		syscall.SYMBOLIC_LINK_FLAG_DIRECTORY)
+	return err
 }
 
-// Remove removes a shadow copy, which can be specified either by ID or a file
-// system path to a symlink where the shadow copy is mounted.
-func Remove(idOrLink string) error {
-	if !isAdmin() {
-		return errNotAdmin
-	}
-	if g, err := parseID(idOrLink); err == nil {
-		return wmiExec(func(s *sWbemServices) error { return deleteByID(s, g) })
-	}
-	const prefix = `\\?\`
-	var buf [syscall.MAX_PATH]byte
-	n, err := syscall.Readlink(idOrLink, buf[copy(buf[:], prefix):])
-	if err != nil {
-		return fmt.Errorf("vss: not a symlink: %s (%w)", idOrLink, err)
-	}
-	dev := strings.TrimSuffix(string(buf[:len(prefix)+n]), `\`)
-	if !strings.HasPrefix(dev, `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy`) {
-		return fmt.Errorf("vss: not a shadow copy symlink: %s", idOrLink)
-	}
-	err = wmiExec(func(s *sWbemServices) error { return deleteByDeviceObject(s, dev) })
-	if err != nil {
-		return err
-	}
-	return syscall.RemoveDirectory(utf16Ptr(idOrLink))
-}
-
-// ShadowCopy is a subset of Win32_ShadowCopy properties.
+// ShadowCopy is an instance of Win32_ShadowCopy class.
 type ShadowCopy struct {
-	DeviceObject string
 	ID           string
 	InstallDate  time.Time
+	DeviceObject string
 	VolumeName   string
 }
 
-// List returns information about existing shadow copies. If vol is non-empty,
-// only shadow copies for the specified volume are turned.
+const (
+	scSelect    = "SELECT ID,InstallDate,DeviceObject,VolumeName FROM Win32_ShadowCopy"
+	scDevPrefix = `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy`
+)
+
+// unpack converts Win32_ShadowCopy object into ShadowCopy.
+func unpack(v *ole.IDispatch) (*ShadowCopy, error) {
+	sc := new(ShadowCopy)
+	if err := getProp(v, "ID", &sc.ID); err != nil {
+		return nil, err
+	}
+	tryGetProp(v, "DeviceObject", &sc.DeviceObject)
+	tryGetProp(v, "InstallDate", &sc.InstallDate)
+	tryGetProp(v, "VolumeName", &sc.VolumeName)
+	return sc, nil
+}
+
+// Get returns the ShadowCopy for the specified ID, DeviceObject, or symlink
+// path.
+func Get(name string) (*ShadowCopy, error) {
+	if !isAdmin() {
+		return nil, errNotAdmin
+	}
+	sc, _, err := get(name)
+	return sc, err
+}
+
+// get returns the ShadowCopy for the specified ID, DeviceObject, or symlink
+// path. If name is a symlink, then it also returns the Cleaned path.
+func get(name string) (sc *ShadowCopy, symlink string, err error) {
+	var wql string
+	if id := ole.NewGUID(name); id != nil {
+		wql = fmt.Sprintf(scSelect+" WHERE ID=%q", id.String())
+	} else {
+		if name = filepath.Clean(name); !hasPrefixFold(name, scDevPrefix) {
+			const prefix = `\\?\`
+			var buf [syscall.MAX_PATH]byte
+			n, err := syscall.Readlink(name, buf[copy(buf[:], prefix):])
+			if err != nil {
+				return nil, "", fmt.Errorf("vss: not a symlink: %s (%w)", name, err)
+			}
+			dev := string(buf[:len(prefix)+n])
+			if !hasPrefixFold(dev, scDevPrefix) {
+				return nil, "", fmt.Errorf("vss: not a shadow copy symlink: %s", name)
+			}
+			symlink, name = name, dev
+		}
+		wql = fmt.Sprintf(scSelect+" WHERE DeviceObject=%q", strings.TrimSuffix(name, `\`))
+	}
+	err = wmiExec(func(s *sWbemServices) (err error) {
+		sc, err = queryOne(s, wql, unpack)
+		return
+	})
+	return
+}
+
+// List returns existing shadow copies. If vol is non-empty, only shadow copies
+// for the specified volume are turned.
 func List(vol string) ([]*ShadowCopy, error) {
 	if !isAdmin() {
 		return nil, errNotAdmin
 	}
-	var wql = "SELECT DeviceObject,ID,InstallDate,VolumeName FROM Win32_ShadowCopy"
+	var wql = scSelect
 	if vol != "" {
 		vol, err := volumeName(vol)
 		if err != nil {
 			return nil, err
 		}
-		wql += fmt.Sprintf(" WHERE VolumeName=%q", vol)
+		wql = fmt.Sprintf(scSelect+" WHERE VolumeName=%q", vol)
 	}
 	var all []*ShadowCopy
 	err := wmiExec(func(s *sWbemServices) error {
-		return s.execQuery(wql, func(v *ole.IDispatch) (err error) {
-			m, err := getProps(v)
-			if err != nil {
-				return err
+		return s.execQuery(wql, func(v *ole.IDispatch) error {
+			sc, err := unpack(v)
+			if err == nil {
+				all = append(all, sc)
 			}
-			t, err := parseDateTime(m["InstallDate"].(string))
-			if err != nil {
-				return err
-			}
-			all = append(all, &ShadowCopy{
-				DeviceObject: m["DeviceObject"].(string),
-				ID:           m["ID"].(string),
-				InstallDate:  t,
-				VolumeName:   m["VolumeName"].(string),
-			})
-			return nil
+			return err
 		})
 	})
 	return all, err
@@ -152,13 +173,29 @@ func (sc *ShadowCopy) VolumePath() (string, error) {
 	if err != nil || len(m) == 0 {
 		return "", err
 	}
-	sort.Strings(m)
 	return m[0], nil
 }
 
+// Link creates a directory symlink pointing to the contents of the shadow copy.
+func (sc *ShadowCopy) Link(name string) error {
+	return syscall.CreateSymbolicLink(utf16Ptr(name), utf16Ptr(sc.DeviceObject+`\`),
+		syscall.SYMBOLIC_LINK_FLAG_DIRECTORY)
+}
+
+// Remove removes the shadow copy.
+func (sc *ShadowCopy) Remove() error {
+	if !isAdmin() {
+		return errNotAdmin
+	}
+	return wmiExec(func(s *sWbemServices) error {
+		_, err := s.CallMethod("Delete", fmt.Sprintf("Win32_ShadowCopy.ID=%q", sc.ID))
+		return err
+	})
+}
+
 // SplitVolume splits an absolute file path into its volume mount point and the
-// path relative to the mount. For example, "C:\Windows" returns "C:\" and
-// "Windows".
+// path relative to the mount. For example, "C:\Windows\System32" returns "C:\"
+// and "Windows\System32".
 func SplitVolume(name string) (vol string, rel string, err error) {
 	if name = filepath.Clean(name); !filepath.IsAbs(name) {
 		// We don't want GetVolumePathName returning the boot volume for
@@ -176,7 +213,7 @@ func SplitVolume(name string) (vol string, rel string, err error) {
 
 // isAdmin returns whether the current thread is a member of the Administrators
 // group.
-func isAdmin() bool {
+var isAdmin = sync.OnceValue(func() bool {
 	// https://learn.microsoft.com/en-us/windows/win32/api/securitybaseapi/nf-securitybaseapi-checktokenmembership#examples
 	var AdministratorsGroup *windows.SID
 	err := windows.AllocateAndInitializeSid(
@@ -197,7 +234,7 @@ func isAdmin() bool {
 	}()
 	ok, err := windows.Token(0).IsMember(AdministratorsGroup)
 	return ok && err == nil
-}
+})
 
 // createCodeString translates Win32_ShadowCopy.Create return code to a string.
 var createCodeString = map[int64]string{
@@ -238,57 +275,6 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 		vol, rc.Val, createCodeString[rc.Val])
 }
 
-// deleteByID deletes a shadow copy by ID.
-func deleteByID(s *sWbemServices, id *ole.GUID) error {
-	_, err := s.CallMethod("Delete", fmt.Sprintf("Win32_ShadowCopy.ID=%q", id))
-	return err
-}
-
-// deleteByDeviceObject deletes a shadow copy by DeviceObject path.
-func deleteByDeviceObject(s *sWbemServices, dev string) error {
-	id, err := idOfDeviceObject(s, dev)
-	if err != nil {
-		return err
-	}
-	return deleteByID(s, id)
-}
-
-// deviceObjectOfID returns the DeviceObject property of the specified shadow
-// copy ID.
-func deviceObjectOfID(s *sWbemServices, id *ole.GUID) (string, error) {
-	wql := fmt.Sprintf("SELECT DeviceObject FROM Win32_ShadowCopy WHERE ID=%q", id)
-	return queryOne(s, wql, func(sc *ole.IDispatch) (string, error) {
-		if p, err := sc.GetProperty("DeviceObject"); err == nil {
-			defer mustClear(p)
-			return p.ToString(), nil
-		} else {
-			return "", err
-		}
-	})
-}
-
-// idOfDeviceObject returns the ID property of the specified shadow copy
-// DeviceObject.
-func idOfDeviceObject(s *sWbemServices, dev string) (*ole.GUID, error) {
-	wql := fmt.Sprintf("SELECT ID FROM Win32_ShadowCopy WHERE DeviceObject=%q", dev)
-	return queryOne(s, wql, func(sc *ole.IDispatch) (*ole.GUID, error) {
-		if p, err := sc.GetProperty("ID"); err == nil {
-			defer mustClear(p)
-			return parseID(p.ToString())
-		} else {
-			return nil, err
-		}
-	})
-}
-
-// parseID ensures that id is a valid GUID.
-func parseID(id string) (*ole.GUID, error) {
-	if g := ole.NewGUID(id); g != nil {
-		return g, nil
-	}
-	return nil, fmt.Errorf("vss: invalid ID %q", id)
-}
-
 // volumeName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
 // format. If vol is already in the GUID format, it is returned unmodified.
 func volumeName(vol string) (string, error) {
@@ -296,7 +282,7 @@ func volumeName(vol string) (string, error) {
 	if vol = filepath.FromSlash(vol); vol[len(vol)-1] != '\\' {
 		vol += `\`
 	}
-	if len(vol) != volLen || !strings.HasPrefix(vol, `\\?\Volume{`) {
+	if len(vol) != volLen || !hasPrefixFold(vol, `\\?\Volume{`) {
 		var buf [volLen + 1]uint16
 		err := windows.GetVolumeNameForVolumeMountPoint(utf16Ptr(vol), &buf[0], uint32(len(buf)))
 		if err != nil {
@@ -325,6 +311,12 @@ func volumePaths(vol string) ([]string, error) {
 		b = b[min(i+1, len(b)):]
 	}
 	return all, nil
+}
+
+// hasPrefixFold tests whether the string s begins with an ASCII-only prefix
+// ignoring case.
+func hasPrefixFold(s, prefix string) bool {
+	return len(s) >= len(prefix) && strings.EqualFold(s[0:len(prefix)], prefix)
 }
 
 // utf16Ptr converts s to UTF-16 format for Windows API calls.

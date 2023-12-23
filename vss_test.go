@@ -9,6 +9,24 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestListGet(t *testing.T) {
+	if !isAdmin() {
+		t.Skip("not running as admin")
+	}
+	all, err := List("")
+	require.NoError(t, err)
+	if len(all) == 0 {
+		return
+	}
+	want := all[0]
+	have, err := Get(want.ID)
+	require.NoError(t, err)
+	require.Equal(t, want, have)
+	have, err = Get(want.DeviceObject)
+	require.NoError(t, err)
+	require.Equal(t, want, have)
+}
+
 func TestSplitVol(t *testing.T) {
 	_, _, err := SplitVolume(`.`)
 	assert.Error(t, err)

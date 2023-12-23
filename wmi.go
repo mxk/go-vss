@@ -119,6 +119,39 @@ func queryOne[T any](s *sWbemServices, wql string, fn func(v *ole.IDispatch) (T,
 	return out, err
 }
 
+// getProp stores the value of the named property into v, which must be a
+// correctly typed pointer.
+func getProp(d *ole.IDispatch, name string, v any) error {
+	vp, err := d.GetProperty(name)
+	if err != nil {
+		return err
+	}
+	defer mustClear(vp)
+	switch v := v.(type) {
+	case *string:
+		*v = vp.ToString()
+	case *time.Time:
+		*v, err = parseDateTime(vp.ToString())
+	default:
+		panic(fmt.Sprintf("vss: unsupported property type: %T", v))
+	}
+	return err
+}
+
+// tryGetProp tries to store the value of a possibly non-existent named property
+// into v, which must be a correctly typed pointer. It returns whether the
+// property exists and panics on any other error.
+func tryGetProp(d *ole.IDispatch, name string, v any) bool {
+	if err := getProp(d, name, v); err != nil {
+		var e *ole.OleError
+		if errors.As(err, &e) && e.Code() == 0x80020006 { // DISP_E_UNKNOWNNAME
+			return false
+		}
+		panic(err)
+	}
+	return true
+}
+
 // getProps returns all properties of v in a map.
 func getProps(v *ole.IDispatch) (map[string]any, error) {
 	vps, err := v.GetProperty("Properties_")
