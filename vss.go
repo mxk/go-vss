@@ -276,21 +276,22 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 }
 
 // volumeName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
-// format. If vol is already in the GUID format, it is returned unmodified.
-func volumeName(vol string) (string, error) {
+// format. If vol is already in the GUID format, it is returned unmodified,
+// except for the addition of a trailing slash.
+func volumeName(name string) (string, error) {
 	const volLen = len(`\\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`)
-	if vol = filepath.FromSlash(vol); vol[len(vol)-1] != '\\' {
-		vol += `\`
+	if name = filepath.FromSlash(name); name != "" && name[len(name)-1] != '\\' {
+		name += `\`
 	}
-	if len(vol) != volLen || !hasPrefixFold(vol, `\\?\Volume{`) {
+	if len(name) != volLen || !hasPrefixFold(name, `\\?\Volume{`) {
 		var buf [volLen + 1]uint16
-		err := windows.GetVolumeNameForVolumeMountPoint(utf16Ptr(vol), &buf[0], uint32(len(buf)))
+		err := windows.GetVolumeNameForVolumeMountPoint(utf16Ptr(name), &buf[0], uint32(len(buf)))
 		if err != nil {
-			return "", fmt.Errorf("vss: failed to get volume name of %#q (%w)", vol, err)
+			return "", fmt.Errorf("vss: failed to get volume name of %#q (%w)", name, err)
 		}
-		vol = syscall.UTF16ToString(buf[:])
+		name = syscall.UTF16ToString(buf[:])
 	}
-	return vol, nil
+	return name, nil
 }
 
 // volumePaths returns all mount points for the specified volume name.
@@ -298,11 +299,11 @@ func volumePaths(vol string) ([]string, error) {
 	var buf [2 * syscall.MAX_PATH]uint16
 	var n uint32
 	err := windows.GetVolumePathNamesForVolumeName(utf16Ptr(vol), &buf[0], uint32(len(buf)), &n)
-	if n--; err != nil || len(buf) < int(n) {
+	if err != nil || len(buf) < int(n) {
 		return nil, fmt.Errorf("vss: failed to get volume paths for %#q (%w)", vol, err)
 	}
 	var all []string
-	for b := buf[:n]; len(b) > 0; {
+	for b := buf[:n]; len(b) > 1; {
 		i := 0
 		for i < len(b) && b[i] != 0 {
 			i++
@@ -313,13 +314,13 @@ func volumePaths(vol string) ([]string, error) {
 	return all, nil
 }
 
-// hasPrefixFold tests whether the string s begins with an ASCII-only prefix
-// ignoring case.
+// hasPrefixFold tests whether s begins with an ASCII-only prefix ignoring case.
 func hasPrefixFold(s, prefix string) bool {
 	return len(s) >= len(prefix) && strings.EqualFold(s[0:len(prefix)], prefix)
 }
 
-// utf16Ptr converts s to UTF-16 format for Windows API calls.
+// utf16Ptr converts s to UTF-16 format for Windows API calls. It panics if s
+// contains any NUL bytes.
 func utf16Ptr(s string) *uint16 {
 	p, err := syscall.UTF16PtrFromString(s)
 	if err != nil {

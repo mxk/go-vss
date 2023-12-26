@@ -43,6 +43,8 @@ func TestSplitVol(t *testing.T) {
 }
 
 func TestVolName(t *testing.T) {
+	_, err := volumeName(``)
+	require.Error(t, err)
 	name, err := volumeName(`C:`)
 	require.NoError(t, err)
 	paths, err := volumePaths(name)
