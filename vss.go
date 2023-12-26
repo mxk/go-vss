@@ -1,5 +1,6 @@
 //go:build windows
 
+// Package vss exposes Windows Volume Shadow Copy API.
 package vss
 
 import (
