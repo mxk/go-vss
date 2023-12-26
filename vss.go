@@ -19,8 +19,9 @@ import (
 var errNotAdmin = fmt.Errorf("vss: do not have Administrators group privileges (%w)",
 	os.ErrPermission)
 
-// Create creates a new shadow copy of the specified volume (e.g. "C:") and
-// returns its ID.
+// Create creates a new shadow copy of the specified volume and returns its ID.
+// The volume can be specified as a drive letter (e.g. "C:"), mount point, or
+// a globally unique identifier (GUID) name (e.g. "\\?\Volume{GUID}\").
 func Create(vol string) (string, error) {
 	if !isAdmin() {
 		return "", errNotAdmin
@@ -256,8 +257,9 @@ var createCodeString = map[int64]string{
 
 // create creates a new shadow copy of the specified volume and returns its ID.
 func create(s *sWbemServices, vol string) (*ole.GUID, error) {
-	// TODO: Directory mounts
-	vol = filepath.VolumeName(vol) + `\` // Trailing separator is required
+	if vol = filepath.FromSlash(vol); vol != "" && vol[len(vol)-1] != '\\' {
+		vol += `\` // Trailing separator is required
+	}
 	sc, err := s.CallMethod("Get", "Win32_ShadowCopy")
 	if err != nil {
 		return nil, fmt.Errorf("vss: failed to get Win32_ShadowCopy (%w)", err)
@@ -281,7 +283,7 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 func volumeName(name string) (string, error) {
 	const volLen = len(`\\?\Volume{xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}\`)
 	if name = filepath.FromSlash(name); name != "" && name[len(name)-1] != '\\' {
-		name += `\`
+		name += `\` // Trailing separator is required
 	}
 	if len(name) != volLen || !hasPrefixFold(name, `\\?\Volume{`) {
 		var buf [volLen + 1]uint16
