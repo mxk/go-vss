@@ -3,12 +3,9 @@
 package vss
 
 import (
-	"bytes"
 	"errors"
 	"fmt"
-	"os"
 	"runtime"
-	"sort"
 	"strconv"
 	"time"
 	"unsafe"
@@ -182,27 +179,6 @@ func getProps(v *ole.IDispatch) (map[string]any, error) {
 		return nil
 	})
 	return all, err
-}
-
-var _ = dumpProps
-
-// dumpProps writes all properties of v to stderr sorted by name.
-func dumpProps(v *ole.IDispatch) {
-	var b bytes.Buffer
-	defer func() { _, _ = fmt.Fprintf(os.Stderr, "%s\n", b.Bytes()) }()
-	all, err := getProps(v)
-	if err != nil {
-		_, _ = fmt.Fprintln(&b, "dumpProps error:", err)
-		return
-	}
-	keys, w := make([]string, 0, len(all)), 0
-	for k := range all {
-		keys, w = append(keys, k), max(len(k), w)
-	}
-	sort.Strings(keys)
-	for _, k := range keys {
-		_, _ = fmt.Fprintf(&b, "%*s: %v\n", w, k, all[k])
-	}
 }
 
 // parseDateTime converts a WMI datetime string (yyyymmddHHMMSS.mmmmmmsUUU) to
