@@ -21,8 +21,10 @@ var errNotAdmin = fmt.Errorf("vss: do not have Administrators group privileges (
 	os.ErrPermission)
 
 // Create creates a new shadow copy of the specified volume and returns its ID.
-// The volume can be specified as a drive letter (e.g. "C:"), mount point, or
-// a globally unique identifier (GUID) name (e.g. "\\?\Volume{GUID}\").
+// The volume can be specified by its drive letter (e.g. "C:"), mount point, or
+// globally unique identifier (GUID) name (`\\?\Volume{GUID}\`). The returned
+// error will contain os.ErrPermission if the current user does not have
+// Administrators group privileges.
 func Create(vol string) (string, error) {
 	if !isAdmin() {
 		return "", errNotAdmin
@@ -38,9 +40,9 @@ func Create(vol string) (string, error) {
 	return id.String(), nil
 }
 
-// CreateAt creates a new shadow copy and symlinks it at the specified path. The
-// shadow copy is removed if symlinking fails.
-func CreateAt(link, vol string) (err error) {
+// CreateLink creates a new shadow copy and symlinks it at the specified path.
+// The shadow copy is removed if symlinking fails.
+func CreateLink(link, vol string) (err error) {
 	id, err := Create(vol)
 	if err != nil {
 		return err
@@ -76,6 +78,24 @@ func Remove(name string) error {
 	return err
 }
 
+// SplitVolume splits an absolute file path into its volume mount point and the
+// path relative to the mount. For example, "C:\Windows\System32" returns "C:\"
+// and "Windows\System32".
+func SplitVolume(name string) (vol string, rel string, err error) {
+	if name = filepath.Clean(name); !filepath.IsAbs(name) {
+		// We don't want GetVolumePathName returning the boot volume for
+		// relative paths.
+		return "", "", fmt.Errorf("vss: non-absolute path: %s", name)
+	}
+	var buf [syscall.MAX_PATH]uint16
+	if err = windows.GetVolumePathName(utf16Ptr(name), &buf[0], uint32(len(buf))); err != nil {
+		return "", "", fmt.Errorf("vss: GetVolumePathName failed for: %s (%w)", name, err)
+	}
+	vol = syscall.UTF16ToString(buf[:])
+	rel, err = filepath.Rel(vol, name)
+	return
+}
+
 // ShadowCopy is an instance of Win32_ShadowCopy class.
 type ShadowCopy struct {
 	ID           string
@@ -101,8 +121,7 @@ func unpack(v *ole.IDispatch) (*ShadowCopy, error) {
 	return sc, nil
 }
 
-// Get returns the ShadowCopy for the specified ID, DeviceObject, or symlink
-// path.
+// Get returns a ShadowCopy by ID, DeviceObject, or symlink path.
 func Get(name string) (*ShadowCopy, error) {
 	if !isAdmin() {
 		return nil, errNotAdmin
@@ -111,8 +130,8 @@ func Get(name string) (*ShadowCopy, error) {
 	return sc, err
 }
 
-// get returns the ShadowCopy for the specified ID, DeviceObject, or symlink
-// path. If name is a symlink, then it also returns the Cleaned path.
+// get returns a ShadowCopy by ID, DeviceObject, or symlink path. If name is a
+// symlink, then it also returns the cleaned path.
 func get(name string) (sc *ShadowCopy, symlink string, err error) {
 	var wql string
 	if id := ole.NewGUID(name); id != nil {
@@ -120,12 +139,12 @@ func get(name string) (sc *ShadowCopy, symlink string, err error) {
 	} else {
 		if name = filepath.Clean(name); !hasPrefixFold(name, scDevPrefix) {
 			const prefix = `\\?\`
-			var buf [syscall.MAX_PATH]byte
+			var buf [len(prefix) + syscall.MAX_PATH]byte
 			n, err := syscall.Readlink(name, buf[copy(buf[:], prefix):])
 			if err != nil {
 				return nil, "", fmt.Errorf("vss: not a symlink: %s (%w)", name, err)
 			}
-			dev := string(buf[:len(prefix)+n])
+			dev := filepath.Clean(string(buf[:len(prefix)+n]))
 			if !hasPrefixFold(dev, scDevPrefix) {
 				return nil, "", fmt.Errorf("vss: not a shadow copy symlink: %s", name)
 			}
@@ -167,17 +186,6 @@ func List(vol string) ([]*ShadowCopy, error) {
 	return all, err
 }
 
-// VolumePath returns the drive letter and/or folder where the shadow copy's
-// original volume is mounted. If the volume is mounted at multiple locations,
-// only the first one is returned.
-func (sc *ShadowCopy) VolumePath() (string, error) {
-	m, err := volumePaths(sc.VolumeName)
-	if err != nil || len(m) == 0 {
-		return "", err
-	}
-	return m[0], nil
-}
-
 // Link creates a directory symlink pointing to the contents of the shadow copy.
 func (sc *ShadowCopy) Link(name string) error {
 	return syscall.CreateSymbolicLink(utf16Ptr(name), utf16Ptr(sc.DeviceObject+`\`),
@@ -191,26 +199,19 @@ func (sc *ShadowCopy) Remove() error {
 	}
 	return wmiExec(func(s *sWbemServices) error {
 		_, err := s.CallMethod("Delete", fmt.Sprintf("Win32_ShadowCopy.ID=%q", sc.ID))
-		return err
+		return fmt.Errorf("vss: failed to remove shadow copy ID %s (%w)", sc.ID, err)
 	})
 }
 
-// SplitVolume splits an absolute file path into its volume mount point and the
-// path relative to the mount. For example, "C:\Windows\System32" returns "C:\"
-// and "Windows\System32".
-func SplitVolume(name string) (vol string, rel string, err error) {
-	if name = filepath.Clean(name); !filepath.IsAbs(name) {
-		// We don't want GetVolumePathName returning the boot volume for
-		// relative paths.
-		return "", "", fmt.Errorf("vss: path without volume: %s", name)
+// VolumePath returns the drive letter and/or folder where the shadow copy's
+// original volume is mounted. If the volume is mounted at multiple locations,
+// only the first one is returned.
+func (sc *ShadowCopy) VolumePath() (string, error) {
+	m, err := volumePaths(sc.VolumeName)
+	if err != nil || len(m) == 0 {
+		return "", err
 	}
-	var buf [syscall.MAX_PATH]uint16
-	if err = windows.GetVolumePathName(utf16Ptr(name), &buf[0], uint32(len(buf))); err != nil {
-		return "", "", fmt.Errorf("vss: GetVolumePathName failed for: %s (%w)", name, err)
-	}
-	vol = syscall.UTF16ToString(buf[:])
-	rel, err = filepath.Rel(vol, name)
-	return
+	return m[0], nil
 }
 
 // isAdmin returns whether the current thread is a member of the Administrators
@@ -238,22 +239,56 @@ var isAdmin = sync.OnceValue(func() bool {
 	return ok && err == nil
 })
 
-// createCodeString translates Win32_ShadowCopy.Create return code to a string.
-var createCodeString = map[int64]string{
-	0:  "Success",
-	1:  "Access denied",
-	2:  "Invalid argument",
-	3:  "Specified volume not found",
-	4:  "Specified volume not supported",
-	5:  "Unsupported shadow copy context",
-	6:  "Insufficient storage",
-	7:  "Volume is in use",
-	8:  "Maximum number of shadow copies reached",
-	9:  "Another shadow copy operation is already in progress",
-	10: "Shadow copy provider vetoed the operation",
-	11: "Shadow copy provider not registered",
-	12: "Shadow copy provider failure",
-	13: "Unknown error",
+// createError is an error code returned by Win32_ShadowCopy.Create. See:
+// https://learn.microsoft.com/en-us/previous-versions/windows/desktop/vsswmi/create-method-in-class-win32-shadowcopy#return-value
+type createError uint32
+
+// Error implements the error interface.
+func (e createError) Error() string {
+	switch e {
+	case 0:
+		return "Success"
+	case 1:
+		return "Access denied"
+	case 2:
+		return "Invalid argument"
+	case 3:
+		return "Specified volume not found"
+	case 4:
+		return "Specified volume not supported"
+	case 5:
+		return "Unsupported shadow copy context"
+	case 6:
+		return "Insufficient storage"
+	case 7:
+		return "Volume is in use"
+	case 8:
+		return "Maximum number of shadow copies reached"
+	case 9:
+		return "Another shadow copy operation is already in progress"
+	case 10:
+		return "Shadow copy provider vetoed the operation"
+	case 11:
+		return "Shadow copy provider not registered"
+	case 12:
+		return "Shadow copy provider failure"
+	case 13:
+		return "Unknown error"
+	}
+	return ""
+}
+
+// Unwrap implements errors.Unwrap interface.
+func (e createError) Unwrap() error {
+	switch e {
+	case 1:
+		return os.ErrPermission
+	case 2:
+		return os.ErrInvalid
+	case 3:
+		return os.ErrNotExist
+	}
+	return nil
 }
 
 // create creates a new shadow copy of the specified volume and returns its ID.
@@ -274,8 +309,8 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 	if g := ole.NewGUID(id); rc.Val == 0 && g != nil {
 		return g, nil
 	}
-	return nil, fmt.Errorf("vss: Win32_ShadowCopy.Create(%#q) returned %d (%s)",
-		vol, rc.Val, createCodeString[rc.Val])
+	return nil, fmt.Errorf("vss: Win32_ShadowCopy.Create(%#q) returned %d (%w)",
+		vol, rc.Val, createError(rc.Val))
 }
 
 // volumeName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
