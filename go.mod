@@ -1,6 +1,6 @@
 module github.com/mxk/go-vss
 
-go 1.21.5
+go 1.21
 
 require (
 	github.com/go-ole/go-ole v1.3.0
