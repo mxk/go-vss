@@ -1,6 +1,11 @@
 //go:build windows
 
 // Package vss exposes Windows Volume Shadow Copy API.
+//
+// Operations on shadow copies require the process to be running with elevated
+// privileges of a user who is a member of the Administrators group. Returned
+// errors will contain os.ErrPermission in their tree to indicate insufficient
+// privileges.
 package vss
 
 import (
@@ -96,7 +101,8 @@ func SplitVolume(name string) (vol string, rel string, err error) {
 	return
 }
 
-// ShadowCopy is an instance of Win32_ShadowCopy class.
+// ShadowCopy is an instance of Win32_ShadowCopy class. See:
+// https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/aa394428(v=vs.85)
 type ShadowCopy struct {
 	ID           string
 	InstallDate  time.Time
