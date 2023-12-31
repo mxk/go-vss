@@ -94,7 +94,7 @@ func Remove(name string) error {
 		return err
 	}
 	if err = sc.Remove(); err == nil && symlink != "" {
-		err = syscall.RemoveDirectory(utf16Ptr(symlink))
+		err = rmdir(symlink)
 	}
 	return err
 }
@@ -344,6 +344,11 @@ func readlink(name string) (string, error) {
 			return name, nil
 		}
 	}
+}
+
+// rmdir removes the named directory, which may be a symlink.
+func rmdir(name string) error {
+	return syscall.RemoveDirectory(utf16Ptr(name))
 }
 
 // resolveDevice resolves any symbolic links in name and returns the full

@@ -84,6 +84,51 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+func TestIsShadowCopy(t *testing.T) {
+	if len(vssadminList) == 0 {
+		t.Skip("no existing shadow copies")
+	}
+	sc := vssadminList[0]
+	tmp, err := os.MkdirTemp("", "go-vss.")
+	require.NoError(t, err)
+	defer os.Remove(tmp)
+
+	link := filepath.Join(tmp, "link")
+	require.NoError(t, sc.Link(link))
+	defer func() {
+		if _, err := os.Lstat(link); err == nil {
+			_ = rmdir(link)
+		}
+	}()
+
+	if ok, err := IsShadowCopy(tmp); assert.NoError(t, err) {
+		assert.False(t, ok)
+	}
+	if ok, err := IsShadowCopy(sc.DeviceObject); assert.NoError(t, err) {
+		assert.True(t, ok)
+	}
+	if ok, err := IsShadowCopy(link); assert.NoError(t, err) {
+		assert.True(t, ok)
+	}
+	if have, err := Get(link); assert.NoError(t, err) {
+		if have.InstallDate.Sub(sc.InstallDate).Abs() < time.Second {
+			have.InstallDate = sc.InstallDate
+		}
+		assert.Equal(t, sc, have)
+	}
+	if all, err := os.ReadDir(link); assert.NoError(t, err) && len(all) > 0 {
+		file := filepath.Join(link, all[0].Name())
+		if ok, err := IsShadowCopy(file); assert.NoError(t, err) {
+			assert.True(t, ok)
+		}
+		file = filepath.Join(sc.DeviceObject, all[0].Name())
+		if ok, err := IsShadowCopy(file); assert.NoError(t, err) {
+			assert.True(t, ok)
+		}
+	}
+	assert.NoError(t, rmdir(link))
+}
+
 func TestSplitVol(t *testing.T) {
 	_, _, err := SplitVolume(`.`)
 	assert.Error(t, err)
