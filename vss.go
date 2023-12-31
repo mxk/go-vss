@@ -64,6 +64,22 @@ func CreateLink(link, vol string) (err error) {
 	return sc.Link(link)
 }
 
+// IsShadowCopy returns whether name is a path referring to the contents of a
+// shadow copy.
+func IsShadowCopy(name string) (bool, error) {
+	// https://github.com/golang/go/issues/63703#issuecomment-1872960199
+	if isShadowPath(name) {
+		return true, nil
+	}
+	if target, err := readlink(name); err == nil {
+		if name = target; isShadowPath(target) {
+			return true, nil
+		}
+	}
+	name, err := resolveDevice(name)
+	return isShadowPath(name), err
+}
+
 // Remove removes a shadow copy by ID, DeviceObject, or symlink path. If a valid
 // symlink is specified, then it is also removed.
 func Remove(name string) error {
@@ -86,13 +102,13 @@ func Remove(name string) error {
 // SplitVolume splits an absolute file path into its volume mount point and the
 // path relative to the mount. For example, "C:\Windows\System32" returns "C:\"
 // and "Windows\System32".
-func SplitVolume(name string) (vol string, rel string, err error) {
+func SplitVolume(name string) (vol, rel string, err error) {
 	if name = filepath.Clean(name); !filepath.IsAbs(name) {
 		// We don't want GetVolumePathName returning the boot volume for
 		// relative paths.
 		return "", "", fmt.Errorf("vss: non-absolute path: %s", name)
 	}
-	var buf [syscall.MAX_PATH]uint16
+	buf := make([]uint16, max(len(name), syscall.MAX_PATH))
 	if err = windows.GetVolumePathName(utf16Ptr(name), &buf[0], uint32(len(buf))); err != nil {
 		return "", "", fmt.Errorf("vss: GetVolumePathName failed for: %s (%w)", name, err)
 	}
@@ -110,10 +126,7 @@ type ShadowCopy struct {
 	VolumeName   string
 }
 
-const (
-	scSelect    = "SELECT ID,InstallDate,DeviceObject,VolumeName FROM Win32_ShadowCopy"
-	scDevPrefix = `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy`
-)
+const scSelect = "SELECT ID,InstallDate,DeviceObject,VolumeName FROM Win32_ShadowCopy"
 
 // unpack converts Win32_ShadowCopy object into ShadowCopy.
 func unpack(v *ole.IDispatch) (*ShadowCopy, error) {
@@ -143,20 +156,17 @@ func get(name string) (sc *ShadowCopy, symlink string, err error) {
 	if id := ole.NewGUID(name); id != nil {
 		wql = fmt.Sprintf(scSelect+" WHERE ID=%q", id.String())
 	} else {
-		if name = filepath.Clean(name); !hasPrefixFold(name, scDevPrefix) {
-			const prefix = `\\?\`
-			var buf [len(prefix) + syscall.MAX_PATH]byte
-			n, err := syscall.Readlink(name, buf[copy(buf[:], prefix):])
+		if name = filepath.Clean(name); !isShadowPath(name) {
+			dev, err := readlink(name)
 			if err != nil {
 				return nil, "", fmt.Errorf("vss: not a symlink: %s (%w)", name, err)
 			}
-			dev := filepath.Clean(string(buf[:len(prefix)+n]))
-			if !hasPrefixFold(dev, scDevPrefix) {
+			if !isShadowPath(dev) {
 				return nil, "", fmt.Errorf("vss: not a shadow copy symlink: %s", name)
 			}
 			symlink, name = name, dev
 		}
-		wql = fmt.Sprintf(scSelect+" WHERE DeviceObject=%q", strings.TrimSuffix(name, `\`))
+		wql = fmt.Sprintf(scSelect+" WHERE DeviceObject=%q", strings.TrimSuffix(normShadowPath(name), `\`))
 	}
 	err = wmiExec(func(s *sWbemServices) (err error) {
 		sc, err = queryOne(s, wql, unpack)
@@ -319,6 +329,50 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 		vol, rc.Val, createError(rc.Val))
 }
 
+// readlink returns the destination of the named symbolic link.
+func readlink(name string) (string, error) {
+	for bufSize := syscall.MAX_PATH; ; bufSize *= 2 {
+		buf := make([]byte, bufSize)
+		n, err := syscall.Readlink(name, buf)
+		if err != nil {
+			return "", err
+		}
+		if n < len(buf) {
+			if name = filepath.Clean(string(buf[:n])); isShadowPath(name) {
+				name = normShadowPath(name)
+			}
+			return name, nil
+		}
+	}
+}
+
+// resolveDevice resolves any symbolic links in name and returns the full
+// canonical path using device volume name.
+func resolveDevice(name string) (string, error) {
+	const access = 0
+	const share = syscall.FILE_SHARE_READ | syscall.FILE_SHARE_WRITE
+	const create = syscall.OPEN_EXISTING
+	// See https://docs.microsoft.com/en-us/windows/desktop/FileIO/symbolic-link-effects-on-file-systems-functions#createfile-and-createfiletransacted
+	const flag = syscall.FILE_FLAG_BACKUP_SEMANTICS | syscall.FILE_FLAG_OPEN_REPARSE_POINT
+	h, err := windows.CreateFile(utf16Ptr(name), access, share, nil, create, flag, 0)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = windows.CloseHandle(h) }()
+	bufSize := uint32(2 * syscall.MAX_PATH)
+	for range [2]struct{}{} {
+		buf := make([]uint16, bufSize)
+		n, err := windows.GetFinalPathNameByHandle(h, &buf[0], bufSize, 0x2) // VOLUME_NAME_NT
+		if err != nil {
+			return "", err
+		}
+		if bufSize = n; n < uint32(len(buf)) {
+			return syscall.UTF16ToString(buf[:n]), nil
+		}
+	}
+	panic("vss: should not happen")
+}
+
 // volumeName converts a drive letter or a mounted folder to `\\?\Volume{GUID}\`
 // format. If vol is already in the GUID format, it is returned unmodified,
 // except for the addition of a trailing slash.
@@ -356,6 +410,39 @@ func volumePaths(vol string) ([]string, error) {
 		b = b[min(i+1, len(b)):]
 	}
 	return all, nil
+}
+
+// isShadowPath returns whether s is a shadow copy path.
+func isShadowPath(s string) bool {
+	return trimShadowPath(s) != ""
+}
+
+// normShadowPath ensures that s starts with the canonical shadow copy
+// DeviceObject name. It returns an empty string if s does not refer to a shadow
+// copy.
+func normShadowPath(s string) string {
+	const prefix = `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy`
+	if hasPrefixFold(s, prefix) {
+		return s
+	}
+	if s = trimShadowPath(s); s != "" {
+		return prefix + s
+	}
+	return ""
+}
+
+// trimShadowPath removes the shadow copy device prefix just before the volume
+// number. It returns an empty string if s does not refer to a shadow copy.
+func trimShadowPath(s string) string {
+	s, _ = strings.CutPrefix(s, `\\?\`)
+	if hasPrefixFold(s, `GLOBALROOT\`) {
+		s = s[len(`GLOBALROOT`):]
+	}
+	const prefix = `\Device\HarddiskVolumeShadowCopy`
+	if hasPrefixFold(s, prefix) {
+		return s[len(prefix):]
+	}
+	return ""
 }
 
 // hasPrefixFold tests whether s begins with an ASCII-only prefix ignoring case.
