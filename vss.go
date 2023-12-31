@@ -215,7 +215,10 @@ func (sc *ShadowCopy) Remove() error {
 	}
 	return wmiExec(func(s *sWbemServices) error {
 		_, err := s.CallMethod("Delete", fmt.Sprintf("Win32_ShadowCopy.ID=%q", sc.ID))
-		return fmt.Errorf("vss: failed to remove shadow copy ID %s (%w)", sc.ID, err)
+		if err != nil {
+			err = fmt.Errorf("vss: failed to remove shadow copy ID %s (%w)", sc.ID, err)
+		}
+		return err
 	})
 }
 
