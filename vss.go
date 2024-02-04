@@ -258,12 +258,12 @@ var isAdmin = sync.OnceValue(func() bool {
 	return ok && err == nil
 })
 
-// createError is an error code returned by Win32_ShadowCopy.Create. See:
+// CreateError is an error code returned by Win32_ShadowCopy.Create. See:
 // https://learn.microsoft.com/en-us/previous-versions/windows/desktop/vsswmi/create-method-in-class-win32-shadowcopy#return-value
-type createError uint32
+type CreateError uint32
 
 // Error implements the error interface.
-func (e createError) Error() string {
+func (e CreateError) Error() string {
 	switch e {
 	case 0:
 		return "Success"
@@ -298,7 +298,7 @@ func (e createError) Error() string {
 }
 
 // Unwrap implements errors.Unwrap interface.
-func (e createError) Unwrap() error {
+func (e CreateError) Unwrap() error {
 	switch e {
 	case 1:
 		return os.ErrPermission
@@ -329,7 +329,7 @@ func create(s *sWbemServices, vol string) (*ole.GUID, error) {
 		return g, nil
 	}
 	return nil, fmt.Errorf("vss: Win32_ShadowCopy.Create(%#q) returned %d (%w)",
-		vol, rc.Val, createError(rc.Val))
+		vol, rc.Val, CreateError(rc.Val))
 }
 
 // readlink returns the destination of the named symbolic link.
