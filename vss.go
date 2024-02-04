@@ -118,6 +118,7 @@ func SplitVolume(name string) (vol, rel string, err error) {
 }
 
 // ShadowCopy is an instance of Win32_ShadowCopy class. See:
+//
 // https://learn.microsoft.com/en-us/previous-versions/windows/desktop/legacy/aa394428(v=vs.85)
 type ShadowCopy struct {
 	ID           string
@@ -259,6 +260,7 @@ var isAdmin = sync.OnceValue(func() bool {
 })
 
 // CreateError is an error code returned by Win32_ShadowCopy.Create. See:
+//
 // https://learn.microsoft.com/en-us/previous-versions/windows/desktop/vsswmi/create-method-in-class-win32-shadowcopy#return-value
 type CreateError uint32
 
