@@ -192,7 +192,8 @@ func parseDateTime(dt string) (time.Time, error) {
 	}
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/swbemdatetime-utc
 	off, err := strconv.Atoi(dt[sign:])
-	if err != nil || off < -720 || 720 < off {
+	// Line Islands in the Pacific have UTC+14 (LINT), so we use 840 (UTC+14*60) as the max offset.
+	if err != nil || off < -720 || 840 < off {
 		return time.Time{}, fmt.Errorf("vss: invalid datetime UTC offset: %s", dt)
 	}
 	// https://learn.microsoft.com/en-us/windows/win32/wmisdk/cim-datetime
